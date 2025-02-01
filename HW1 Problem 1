@@ -1,0 +1,238 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader, random_split
+import matplotlib.pyplot as plt
+from sklearn.datasets import fetch_california_housing
+from sklearn.metrics import r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+
+##############################
+#  Helper Functions
+##############################
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device):
+    train_losses = []
+    val_losses = []
+    best_val_r2 = -np.inf
+    best_model_state = None
+
+    for epoch in range(num_epochs):
+        # Training
+        model.train()
+        running_loss = 0.0
+        preds_train = []
+        targets_train = []
+        for X, y in train_loader:
+            X, y = X.to(device), y.to(device)
+            optimizer.zero_grad()
+            outputs = model(X)
+            loss = criterion(outputs, y)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * X.size(0)
+            preds_train.append(outputs.detach().cpu().numpy())
+            targets_train.append(y.detach().cpu().numpy())
+        epoch_loss = running_loss / len(train_loader.dataset)
+        train_losses.append(epoch_loss)
+        
+        # Compute training R^2 (optional)
+        preds_train = np.concatenate(preds_train, axis=0)
+        targets_train = np.concatenate(targets_train, axis=0)
+        train_r2 = r2_score(targets_train, preds_train)
+        
+        # Validation
+        model.eval()
+        running_loss_val = 0.0
+        preds_val = []
+        targets_val = []
+        with torch.no_grad():
+            for X_val, y_val in val_loader:
+                X_val, y_val = X_val.to(device), y_val.to(device)
+                outputs_val = model(X_val)
+                loss_val = criterion(outputs_val, y_val)
+                running_loss_val += loss_val.item() * X_val.size(0)
+                preds_val.append(outputs_val.detach().cpu().numpy())
+                targets_val.append(y_val.detach().cpu().numpy())
+        epoch_val_loss = running_loss_val / len(val_loader.dataset)
+        val_losses.append(epoch_val_loss)
+        preds_val = np.concatenate(preds_val, axis=0)
+        targets_val = np.concatenate(targets_val, axis=0)
+        val_r2 = r2_score(targets_val, preds_val)
+        
+        print(f"Epoch {epoch+1}/{num_epochs}: Train Loss={epoch_loss:.4f}, Train R2={train_r2:.4f} | Val Loss={epoch_val_loss:.4f}, Val R2={val_r2:.4f}")
+        
+        if val_r2 > best_val_r2:
+            best_val_r2 = val_r2
+            best_model_state = model.state_dict()
+            
+    return train_losses, val_losses, best_val_r2, best_model_state
+
+def plot_curves(train_losses, val_losses, title_suffix=""):
+    epochs = np.arange(1, len(train_losses)+1)
+    plt.figure(figsize=(8,5))
+    plt.plot(epochs, train_losses, label="Train Loss")
+    plt.plot(epochs, val_losses, label="Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE Loss")
+    plt.title("Training vs. Validation Loss " + title_suffix)
+    plt.legend()
+    plt.show()
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+##############################
+#  Data Preparation
+##############################
+
+# Load California Housing dataset (8 features)
+data = fetch_california_housing()
+X = data.data   # shape (20640, 8)
+y = data.target.reshape(-1, 1)  # shape (20640, 1)
+
+# For reproducibility
+np.random.seed(42)
+torch.manual_seed(42)
+
+# Split data (80% train, 20% validation)
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+##############################
+# 2.a Model: Without One-Hot Encoding
+##############################
+
+# In 2.a, we use the original numeric features (8 features)
+X_train_a = X_train.astype(np.float32)
+X_val_a = X_val.astype(np.float32)
+y_train_a = y_train.astype(np.float32)
+y_val_a = y_val.astype(np.float32)
+
+# Create TensorDatasets and DataLoaders
+train_dataset_a = TensorDataset(torch.from_numpy(X_train_a), torch.from_numpy(y_train_a))
+val_dataset_a = TensorDataset(torch.from_numpy(X_val_a), torch.from_numpy(y_val_a))
+
+batch_size = 64
+train_loader_a = DataLoader(train_dataset_a, batch_size=batch_size, shuffle=True)
+val_loader_a = DataLoader(val_dataset_a, batch_size=batch_size, shuffle=False)
+
+# Define an MLP regressor with three hidden layers (example dimensions: 64, 32, 16)
+class MLPRegression(nn.Module):
+    def __init__(self, input_size, hidden_sizes, output_size=1):
+        super(MLPRegression, self).__init__()
+        layers = []
+        prev_size = input_size
+        for h in hidden_sizes:
+            layers.append(nn.Linear(prev_size, h))
+            layers.append(nn.ReLU())
+            prev_size = h
+        layers.append(nn.Linear(prev_size, output_size))
+        self.model = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        return self.model(x)
+
+input_size_a = X_train_a.shape[1]  # 8
+hidden_sizes_a = [64, 32, 16]
+model_a = MLPRegression(input_size_a, hidden_sizes_a).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+print("2.a Model parameter count:", count_parameters(model_a))
+
+criterion_a = nn.MSELoss()
+optimizer_a = optim.Adam(model_a.parameters(), lr=0.001)
+num_epochs = 100
+
+print("\nTraining Model 2.a (Without One-Hot Encoding)...")
+train_losses_a, val_losses_a, best_r2_a, best_state_a = train_model(model_a, train_loader_a, val_loader_a, criterion_a, optimizer_a, num_epochs, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+plot_curves(train_losses_a, val_losses_a, title_suffix="(2.a)")
+print("Best Validation R2 (2.a):", best_r2_a)
+
+# Save model parameters
+torch.save(best_state_a, "mlp_regression_2a.pth")
+
+##############################
+# 2.b Model: With One-Hot Encoding for a Categorical Feature
+##############################
+
+# For demonstration, we convert the "HouseAge" feature (index 1) into a categorical variable.
+# We bin HouseAge into 3 bins (for example, using quantiles) and one-hot encode it.
+# Then, we remove the original HouseAge and replace it with the one-hot columns.
+
+# We'll use the training set X_train from above.
+house_age = X_train[:, 1]  # HouseAge column (index 1)
+# Compute bin edges based on quantiles
+bins = np.quantile(house_age, [0, 0.33, 0.66, 1.0])
+# Digitize the values (resulting in 1,2,3)
+cat_feature_train = np.digitize(house_age, bins[1:-1])
+# One-hot encode
+encoder = OneHotEncoder(sparse=False, categories='auto')
+cat_feature_train_oh = encoder.fit_transform(cat_feature_train.reshape(-1,1))
+
+# Do the same for validation set
+house_age_val = X_val[:, 1]
+cat_feature_val = np.digitize(house_age_val, bins[1:-1])
+cat_feature_val_oh = encoder.transform(cat_feature_val.reshape(-1,1))
+
+# Remove the original HouseAge column (index 1) and replace it with its one-hot encoding.
+def replace_house_age_with_oh(X, cat_oh):
+    return np.hstack([X[:, :1], cat_oh, X[:, 2:]])
+
+X_train_b = replace_house_age_with_oh(X_train, cat_feature_train_oh).astype(np.float32)
+X_val_b = replace_house_age_with_oh(X_val, cat_feature_val_oh).astype(np.float32)
+# Now, input dimension: 8 - 1 + 3 = 10.
+input_size_b = X_train_b.shape[1]
+y_train_b = y_train.astype(np.float32)
+y_val_b = y_val.astype(np.float32)
+
+# Create TensorDatasets and DataLoaders for 2.b
+train_dataset_b = TensorDataset(torch.from_numpy(X_train_b), torch.from_numpy(y_train_b))
+val_dataset_b = TensorDataset(torch.from_numpy(X_val_b), torch.from_numpy(y_val_b))
+train_loader_b = DataLoader(train_dataset_b, batch_size=batch_size, shuffle=True)
+val_loader_b = DataLoader(val_dataset_b, batch_size=batch_size, shuffle=False)
+
+# Use the same architecture as 2.a (three hidden layers: 64, 32, 16) but input size is 10.
+model_b = MLPRegression(input_size_b, hidden_sizes_a).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+print("\n2.b Model parameter count:", count_parameters(model_b))
+criterion_b = nn.MSELoss()
+optimizer_b = optim.Adam(model_b.parameters(), lr=0.001)
+
+print("\nTraining Model 2.b (With One-Hot Encoding)...")
+train_losses_b, val_losses_b, best_r2_b, best_state_b = train_model(model_b, train_loader_b, val_loader_b, criterion_b, optimizer_b, num_epochs, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+plot_curves(train_losses_b, val_losses_b, title_suffix="(2.b)")
+print("Best Validation R2 (2.b):", best_r2_b)
+torch.save(best_state_b, "mlp_regression_2b.pth")
+
+##############################
+# 2.c Increase Complexity for 2.b and Compare
+##############################
+
+# Here we define a more complex MLP: for example, increase both depth and width.
+# Let’s use 4 hidden layers with dimensions [128, 64, 32, 16].
+hidden_sizes_c = [128, 64, 32, 16]
+model_c = MLPRegression(input_size_b, hidden_sizes_c).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+print("\n2.c Complex Model (for one-hot encoded features) parameter count:", count_parameters(model_c))
+criterion_c = nn.MSELoss()
+optimizer_c = optim.Adam(model_c.parameters(), lr=0.001)
+
+print("\nTraining Model 2.c (Increased Complexity)...")
+train_losses_c, val_losses_c, best_r2_c, best_state_c = train_model(model_c, train_loader_b, val_loader_b, criterion_c, optimizer_c, num_epochs, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+plot_curves(train_losses_c, val_losses_c, title_suffix="(2.c)")
+print("Best Validation R2 (2.c):", best_r2_c)
+torch.save(best_state_c, "mlp_regression_2c.pth")
+
+##############################
+# Final Comparison and Reporting
+##############################
+
+print("\nFinal Report:")
+print("2.a (Raw Features) Best Validation R2: {:.4f}".format(best_r2_a))
+print("2.b (One-Hot Encoded) Best Validation R2: {:.4f}".format(best_r2_b))
+print("2.c (Complex Network with One-Hot) Best Validation R2: {:.4f}".format(best_r2_c))
+
+print("\nModel Complexity (Parameter Count):")
+print("2.a: {} parameters".format(count_parameters(model_a)))
+print("2.b: {} parameters".format(count_parameters(model_b)))
+print("2.c: {} parameters".format(count_parameters(model_c)))
