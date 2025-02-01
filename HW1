@@ -1,1 +1,155 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, classification_report
+
+# Transform: convert images to tensors and normalize; we will flatten inside the model.
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
+])
+
+# Download CIFAR-10 training and test datasets
+train_val_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+
+# Split training data into training and validation (80/20)
+train_size = int(0.8 * len(train_val_dataset))
+val_size = len(train_val_dataset) - train_size
+train_dataset, val_dataset = random_split(train_val_dataset, [train_size, val_size])
+
+batch_size = 128
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+print(f"Train samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+print(f"Test samples: {len(test_dataset)}")
+
+
+class BaselineMLP(nn.Module):
+    def __init__(self, input_size=3072, num_classes=10):
+        super(BaselineMLP, self).__init__()
+        self.model = nn.Sequential(
+            nn.Flatten(),  # Flatten input: 3*32*32 = 3072
+            nn.Linear(input_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Training on device:", device)
+
+# Instantiate model, loss function, and optimizer
+baseline_model = BaselineMLP().to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(baseline_model.parameters(), lr=0.001)
+
+num_epochs = 20
+
+train_losses = []
+train_accuracies = []
+val_accuracies = []
+
+for epoch in range(num_epochs):
+    baseline_model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = baseline_model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+        _, predicted = torch.max(outputs, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+    epoch_loss = running_loss / total
+    epoch_train_acc = correct / total
+    train_losses.append(epoch_loss)
+    train_accuracies.append(epoch_train_acc)
+
+    # Validation
+    baseline_model.eval()
+    val_correct = 0
+    val_total = 0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = baseline_model(images)
+            _, predicted = torch.max(outputs, 1)
+            val_total += labels.size(0)
+            val_correct += (predicted == labels).sum().item()
+    epoch_val_acc = val_correct / val_total
+    val_accuracies.append(epoch_val_acc)
+
+    print(
+        f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}, Train Acc: {epoch_train_acc:.4f}, Val Acc: {epoch_val_acc:.4f}")
+
+torch.save(baseline_model.state_dict(), "baseline_mlp_cifar10.pth")
+
+plt.figure(figsize=(12,5))
+
+plt.subplot(1,2,1)
+plt.plot(train_losses, label="Train Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Training Loss")
+plt.legend()
+
+plt.subplot(1,2,2)
+plt.plot(train_accuracies, label="Train Accuracy")
+plt.plot(val_accuracies, label="Validation Accuracy")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.title("Training and Validation Accuracy")
+plt.legend()
+
+plt.show()
+
+baseline_model.eval()
+all_labels = []
+all_preds = []
+
+with torch.no_grad():
+    for images, labels in test_loader:
+        images = images.to(device)
+        outputs = baseline_model(images)
+        _, predicted = torch.max(outputs, 1)
+        all_labels.extend(labels.cpu().numpy())
+        all_preds.extend(predicted.cpu().numpy())
+
+# Compute metrics
+precision = precision_score(all_labels, all_preds, average='macro')
+recall = recall_score(all_labels, all_preds, average='macro')
+f1 = f1_score(all_labels, all_preds, average='macro')
+cm = confusion_matrix(all_labels, all_preds)
+
+print("Test Precision: {:.4f}".format(precision))
+print("Test Recall: {:.4f}".format(recall))
+print("Test F1 Score: {:.4f}".format(f1))
+print("Confusion Matrix:\n", cm)
+print("\nClassification Report:\n", classification_report(all_labels, all_preds, target_names=test_dataset.classes))
 
