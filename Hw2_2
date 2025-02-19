@@ -1,0 +1,251 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+
+
+##################################################
+#   1) Model Definition: Custom VGG-like Network  #
+##################################################
+
+
+def make_layers(cfg, batch_norm=False):
+    """
+    Utility function to construct the convolutional layers based on a config list.
+    Each integer 'x' is a number of output channels, 'M' indicates max-pooling.
+    """
+    layers = []
+    in_channels = 3
+    for v in cfg:
+        if v == 'M':
+            layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+        else:
+            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
+            if batch_norm:
+                layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+            else:
+                layers += [conv2d, nn.ReLU(inplace=True)]
+            in_channels = v
+    return nn.Sequential(*layers)
+
+
+class CustomVGG(nn.Module):
+    """
+    A VGG-like network adapted for 32x32 input.
+    The 'cfg' list defines the structure (conv layers, pool layers).
+    """
+
+    def __init__(self, cfg, num_classes=10, use_dropout=False, batch_norm=False):
+        super(CustomVGG, self).__init__()
+
+        self.features = make_layers(cfg, batch_norm=batch_norm)
+
+        # For 32x32 inputs, each 'M' reduces spatial size by half.
+        # With three 'M's, final size is 4x4 (for a standard VGG-like config).
+        # If your config has more/less 'M', adjust the following logic accordingly.
+
+        # Figure out the final output channels from cfg
+        final_channels = [v for v in cfg if v != 'M'][-1]
+
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(final_channels * 4 * 4, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5) if use_dropout else nn.Identity(),
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)  # Flatten
+        x = self.classifier(x)
+        return x
+
+
+##################################################
+#   2) Example VGG Configuration (like VGG-11)    #
+##################################################
+
+
+# Example config for a "VGG-11"-style network:
+# - 2 conv layers, pool, 2 conv layers, pool, 3 conv layers, pool
+# You can modify this list to adjust the total parameter count.
+vgg11_cfg = [64, 'M', 128, 'M', 256, 256, 'M']
+
+
+##################################################
+# 3) Training and Evaluation Utilities           #
+##################################################
+
+
+def train_one_epoch(model, device, train_loader, optimizer):
+    model.train()
+    running_loss = 0.0
+    for data, target in train_loader:
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.cross_entropy(output, target)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    return running_loss / len(train_loader)
+
+
+def evaluate(model, device, val_loader):
+    model.eval()
+    val_loss = 0.0
+    correct = 0
+    with torch.no_grad():
+        for data, target in val_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss = F.cross_entropy(output, target, reduction='sum')
+            val_loss += loss.item()
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+    val_loss /= len(val_loader.dataset)
+    accuracy = correct / len(val_loader.dataset)
+    return val_loss, accuracy
+
+
+##################################################
+# 4) Experiment Runner: With vs. Without Dropout #
+##################################################
+
+
+def run_experiment(use_dropout, dataset='cifar10', cfg=vgg11_cfg, epochs=10, batch_size=128, lr=0.001):
+    """
+    Trains a CustomVGG on the specified dataset (CIFAR-10 or CIFAR-100)
+    with or without dropout. Returns training losses, validation losses,
+    and validation accuracies for each epoch.
+    """
+    # Choose number of classes
+    if dataset.lower() == 'cifar10':
+        num_classes = 10
+    else:
+        num_classes = 100
+
+    # Data transforms
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+
+    # Datasets
+    if dataset.lower() == 'cifar10':
+        train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+        val_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+    else:
+        train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
+        val_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Model
+    model = CustomVGG(cfg=cfg, num_classes=num_classes, use_dropout=use_dropout, batch_norm=False).to(device)
+
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Dataset: {dataset.upper()}, Dropout={use_dropout}, Params={total_params}")
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    train_losses, val_losses, val_accs = [], [], []
+
+    for epoch in range(1, epochs + 1):
+        tr_loss = train_one_epoch(model, device, train_loader, optimizer)
+        v_loss, v_acc = evaluate(model, device, val_loader)
+
+        train_losses.append(tr_loss)
+        val_losses.append(v_loss)
+        val_accs.append(v_acc)
+
+        print(f"[{dataset.upper()} - Dropout={use_dropout}] Epoch {epoch}/{epochs}: "
+              f"Train Loss={tr_loss:.4f}, Val Loss={v_loss:.4f}, Val Acc={v_acc * 100:.2f}%")
+
+    return train_losses, val_losses, val_accs
+
+
+##################################################
+# 5) Main Script: Compare Dropout vs No-Dropout  #
+##################################################
+
+
+def main():
+    EPOCHS = 100
+    BATCH_SIZE = 128
+    LR = 0.001
+
+    # We'll loop over both datasets
+    for dataset_name in ['cifar10', 'cifar100']:
+        # Run without dropout
+        train_losses_no, val_losses_no, val_accs_no = run_experiment(
+            use_dropout=False,
+            dataset=dataset_name,
+            cfg=vgg11_cfg,  # Our chosen config
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            lr=LR
+        )
+
+        # Run with dropout
+        train_losses_do, val_losses_do, val_accs_do = run_experiment(
+            use_dropout=True,
+            dataset=dataset_name,
+            cfg=vgg11_cfg,
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            lr=LR
+        )
+
+        # Plot the results
+        epochs_range = range(1, EPOCHS + 1)
+
+        plt.figure(figsize=(12, 5))
+        plt.suptitle(f"VGG Comparison: Dropout vs. No Dropout on {dataset_name.upper()}", fontsize=16)
+
+        # Subplot 1: Loss curves
+        plt.subplot(1, 2, 1)
+        plt.plot(epochs_range, train_losses_no, 'b-o', label="Train Loss (No Dropout)")
+        plt.plot(epochs_range, val_losses_no, 'b--o', label="Val Loss (No Dropout)")
+        plt.plot(epochs_range, train_losses_do, 'r-o', label="Train Loss (Dropout)")
+        plt.plot(epochs_range, val_losses_do, 'r--o', label="Val Loss (Dropout)")
+        plt.xlabel("Epochs")
+        plt.ylabel("Loss")
+        plt.title("Loss Curves")
+        plt.legend()
+
+        # Subplot 2: Validation Accuracy
+        plt.subplot(1, 2, 2)
+        plt.plot(epochs_range, [acc * 100 for acc in val_accs_no], 'b-o', label="Val Acc (No Dropout)")
+        plt.plot(epochs_range, [acc * 100 for acc in val_accs_do], 'r-o', label="Val Acc (Dropout)")
+        plt.xlabel("Epochs")
+        plt.ylabel("Accuracy (%)")
+        plt.title("Validation Accuracy")
+        plt.legend()
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
