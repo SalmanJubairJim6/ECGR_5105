@@ -1,0 +1,332 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+
+
+#############################################
+# 1) Define the BasicBlock and ResNet class #
+#############################################
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1, dropout=False):
+        super(BasicBlock, self).__init__()
+        self.dropout_flag = dropout
+
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        # Dropout layer for optional regularization
+        self.dropout = nn.Dropout(p=0.5) if dropout else nn.Identity()
+
+        # Shortcut if dimensions change (e.g., stride != 1)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes * self.expansion:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes * self.expansion, kernel_size=1,
+                          stride=stride, bias=False),
+                nn.BatchNorm2d(planes * self.expansion)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class ResNet(nn.Module):
+    """
+    A generic ResNet class that can build various depths based on
+    the number of blocks in each layer (num_blocks).
+    """
+
+    def __init__(self, block, num_blocks, num_classes=10, dropout=False):
+        super(ResNet, self).__init__()
+        self.in_planes = 64
+
+        # Initial layer for CIFAR: 3x32x32 -> 64x32x32
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+
+        # Create each layer
+        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1, dropout=dropout)
+        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2, dropout=dropout)
+        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2, dropout=dropout)
+        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2, dropout=dropout)
+
+        # Classifier
+        self.linear = nn.Linear(512 * block.expansion, num_classes)
+
+    def _make_layer(self, block, planes, num_blocks, stride, dropout):
+        """
+        Creates a layer consisting of 'num_blocks' BasicBlocks.
+        The first block might use a stride > 1 to downsample.
+        """
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(block(self.in_planes, planes, s, dropout=dropout))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))  # 64x32x32
+        out = self.layer1(out)  # -> 64x32x32
+        out = self.layer2(out)  # -> 128x16x16
+        out = self.layer3(out)  # -> 256x8x8
+        out = self.layer4(out)  # -> 512x4x4
+        out = F.avg_pool2d(out, 4)  # -> 512x1x1
+        out = out.view(out.size(0), -1)  # Flatten
+        out = self.linear(out)
+        return out
+
+
+#############################################
+# 2) Helper functions for building networks #
+#############################################
+
+
+def ResNet11(num_classes=10, dropout=False):
+    """
+    A simplified 'ResNet-11' configuration.
+    Typically: [1,1,1,1] blocks in the 4 layers.
+    """
+    return ResNet(BasicBlock, [1, 1, 1, 1], num_classes=num_classes, dropout=dropout)
+
+
+def ResNet18(num_classes=10, dropout=False):
+    """
+    The standard 'ResNet-18' configuration.
+    Typically: [2,2,2,2] blocks in the 4 layers.
+    """
+    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, dropout=dropout)
+
+
+#############################################
+# 3) Training & Evaluation Routines         #
+#############################################
+
+
+def train_one_epoch(model, device, train_loader, optimizer):
+    model.train()
+    running_loss = 0.0
+    for data, target in train_loader:
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.cross_entropy(output, target)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    return running_loss / len(train_loader)
+
+
+def evaluate(model, device, val_loader):
+    model.eval()
+    val_loss = 0.0
+    correct = 0
+    with torch.no_grad():
+        for data, target in val_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss = F.cross_entropy(output, target, reduction='sum')
+            val_loss += loss.item()
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+    val_loss /= len(val_loader.dataset)
+    accuracy = correct / len(val_loader.dataset)
+    return val_loss, accuracy
+
+
+#############################################
+# 4) Running Experiments                    #
+#############################################
+
+
+def run_experiment(model_name, dataset_name, use_dropout, epochs=10, batch_size=128, lr=0.001):
+    """
+    Trains a specified ResNet (11 or 18) with or without dropout on CIFAR-10 or CIFAR-100.
+    Returns the training losses, validation losses, and validation accuracies for each epoch.
+    """
+    # Select number of classes
+    if dataset_name.lower() == 'cifar10':
+        num_classes = 10
+    else:
+        num_classes = 100
+
+    # Data transforms
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+
+    # Load datasets
+    if dataset_name.lower() == 'cifar10':
+        train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+        val_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+    else:
+        train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
+        val_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    # Create the model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if model_name == 'resnet11':
+        model = ResNet11(num_classes=num_classes, dropout=use_dropout).to(device)
+    elif model_name == 'resnet18':
+        model = ResNet18(num_classes=num_classes, dropout=use_dropout).to(device)
+    else:
+        raise ValueError("Invalid model name. Choose 'resnet11' or 'resnet18'.")
+
+    # Print model size
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[{dataset_name.upper()}] {model_name.upper()}, Dropout={use_dropout}, "
+          f"Params={total_params}")
+
+    # Optimizer
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    train_losses = []
+    val_losses = []
+    val_accs = []
+
+    for epoch in range(1, epochs + 1):
+        tr_loss = train_one_epoch(model, device, train_loader, optimizer)
+        v_loss, v_acc = evaluate(model, device, val_loader)
+
+        train_losses.append(tr_loss)
+        val_losses.append(v_loss)
+        val_accs.append(v_acc)
+
+        print(f"Epoch {epoch}/{epochs}: "
+              f"Train Loss={tr_loss:.4f}, Val Loss={v_loss:.4f}, Val Acc={v_acc * 100:.2f}%")
+
+    return train_losses, val_losses, val_accs
+
+
+#############################################
+# 5) Main: Compare ResNet-11 vs ResNet-18   #
+#    with & without dropout on CIFAR-10/100 #
+#############################################
+
+
+def main():
+    EPOCHS = 50
+    BATCH_SIZE = 128
+    LR = 0.001
+
+    # We will store the results in a nested dictionary, like:
+    # results[dataset][(model_name, dropout)] = (train_losses, val_losses, val_accs)
+    results = {'cifar10': {}, 'cifar100': {}}
+
+    # Possible configurations
+    model_variants = ['resnet11', 'resnet18']
+    dropout_options = [False, True]
+    datasets_list = ['cifar10', 'cifar100']
+
+    # 1) Run all experiments
+    for ds in datasets_list:
+        for mv in model_variants:
+            for do in dropout_options:
+                key = (mv, do)
+                train_losses, val_losses, val_accs = run_experiment(
+                    model_name=mv,
+                    dataset_name=ds,
+                    use_dropout=do,
+                    epochs=EPOCHS,
+                    batch_size=BATCH_SIZE,
+                    lr=LR
+                )
+                results[ds][key] = (train_losses, val_losses, val_accs)
+
+    # 2) Plot the results for each dataset
+    for ds in datasets_list:
+        # We expect 4 configurations:
+        # (resnet11, False), (resnet11, True), (resnet18, False), (resnet18, True)
+        configs = [
+            ('resnet11', False),
+            ('resnet11', True),
+            ('resnet18', False),
+            ('resnet18', True)
+        ]
+
+        # Colors/linestyles for clarity
+        color_style_map = {
+            ('resnet11', False): ('b', 'solid'),
+            ('resnet11', True): ('b', 'dashed'),
+            ('resnet18', False): ('r', 'solid'),
+            ('resnet18', True): ('r', 'dashed')
+        }
+
+        plt.figure(figsize=(15, 5))
+        plt.suptitle(f"ResNet-11 vs. ResNet-18 on {ds.upper()} (Dropout vs. No Dropout)", fontsize=16)
+
+        # Subplot 1: Training Loss
+        plt.subplot(1, 3, 1)
+        for config in configs:
+            c, ls = color_style_map[config]
+            train_losses = results[ds][config][0]
+            plt.plot(range(1, EPOCHS + 1), train_losses, color=c, linestyle=ls,
+                     label=f"{config[0].upper()}, Dropout={config[1]}")
+        plt.title("Training Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+
+        # Subplot 2: Validation Loss
+        plt.subplot(1, 3, 2)
+        for config in configs:
+            c, ls = color_style_map[config]
+            val_losses = results[ds][config][1]
+            plt.plot(range(1, EPOCHS + 1), val_losses, color=c, linestyle=ls,
+                     label=f"{config[0].upper()}, Dropout={config[1]}")
+        plt.title("Validation Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+
+        # Subplot 3: Validation Accuracy
+        plt.subplot(1, 3, 3)
+        for config in configs:
+            c, ls = color_style_map[config]
+            val_accs = results[ds][config][2]
+            plt.plot(range(1, EPOCHS + 1), [acc * 100 for acc in val_accs],
+                     color=c, linestyle=ls,
+                     label=f"{config[0].upper()}, Dropout={config[1]}")
+        plt.title("Validation Accuracy")
+        plt.xlabel("Epoch")
+        plt.ylabel("Accuracy (%)")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
