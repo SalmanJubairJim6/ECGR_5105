@@ -157,7 +157,7 @@ def run_experiment(use_dropout, dataset='cifar10', epochs=10, batch_size=128, lr
 
 
 def main():
-    EPOCHS = 10
+    EPOCHS = 50
     BATCH_SIZE = 128
     LR = 0.001
 
