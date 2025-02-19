@@ -1,0 +1,221 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+
+
+#############################
+#   1) Model Definition     #
+#############################
+
+
+class CustomAlexNet(nn.Module):
+    """
+    A simplified version of AlexNet for 32x32 CIFAR images.
+    """
+
+    def __init__(self, num_classes=10, use_dropout=False):
+        super(CustomAlexNet, self).__init__()
+        self.use_dropout = use_dropout
+
+        self.features = nn.Sequential(
+            # Input: 3x32x32
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),  # -> 64x32x32
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # -> 64x16x16
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),  # -> 128x16x16
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # -> 128x8x8
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),  # -> 256x8x8
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2)  # -> 256x4x4
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(256 * 4 * 4, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5) if use_dropout else nn.Identity(),
+            nn.Linear(1024, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)  # Flatten
+        x = self.classifier(x)
+        return x
+
+
+#############################
+# 2) Training & Evaluation  #
+#############################
+
+
+def train_one_epoch(model, device, train_loader, optimizer):
+    model.train()
+    running_loss = 0.0
+    for data, target in train_loader:
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.cross_entropy(output, target)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    return running_loss / len(train_loader)
+
+
+def evaluate(model, device, val_loader):
+    model.eval()
+    val_loss = 0.0
+    correct = 0
+    with torch.no_grad():
+        for data, target in val_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss = F.cross_entropy(output, target, reduction='sum')
+            val_loss += loss.item()
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+    val_loss /= len(val_loader.dataset)
+    accuracy = correct / len(val_loader.dataset)
+    return val_loss, accuracy
+
+
+#############################
+# 3) Helper Function to Run #
+#############################
+
+
+def run_experiment(use_dropout, dataset='cifar10', epochs=10, batch_size=128, lr=0.001):
+    """
+    Trains and evaluates the simplified AlexNet on the specified dataset
+    with or without dropout. Returns lists of training losses, validation
+    losses, and validation accuracies per epoch.
+    """
+    # Choose number of classes based on dataset
+    if dataset.lower() == 'cifar10':
+        num_classes = 10
+    else:
+        num_classes = 100
+
+    # Data transforms
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+
+    # Datasets
+    if dataset.lower() == 'cifar10':
+        train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+        val_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+    else:
+        train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
+        val_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    # Model, optimizer, device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CustomAlexNet(num_classes=num_classes, use_dropout=use_dropout).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # Store metrics
+    train_losses = []
+    val_losses = []
+    val_accs = []
+
+    # Training loop
+    for epoch in range(1, epochs + 1):
+        tr_loss = train_one_epoch(model, device, train_loader, optimizer)
+        v_loss, v_acc = evaluate(model, device, val_loader)
+
+        train_losses.append(tr_loss)
+        val_losses.append(v_loss)
+        val_accs.append(v_acc)
+
+        print(f"[{dataset.upper()} - Dropout={use_dropout}] Epoch {epoch}/{epochs}: "
+              f"Train Loss={tr_loss:.4f}, Val Loss={v_loss:.4f}, Val Acc={v_acc * 100:.2f}%")
+
+    return train_losses, val_losses, val_accs
+
+
+#############################
+#   4) Main Script          #
+#############################
+
+
+def main():
+    EPOCHS = 10
+    BATCH_SIZE = 128
+    LR = 0.001
+
+    # We'll run 2 experiments (with and without dropout) for each dataset
+    for dataset_name in ['cifar10', 'cifar100']:
+        # No Dropout
+        train_losses_no, val_losses_no, val_accs_no = run_experiment(
+            use_dropout=False,
+            dataset=dataset_name,
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            lr=LR
+        )
+
+        # With Dropout
+        train_losses_do, val_losses_do, val_accs_do = run_experiment(
+            use_dropout=True,
+            dataset=dataset_name,
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            lr=LR
+        )
+
+        # Plot the comparison
+        epochs_range = range(1, EPOCHS + 1)
+
+        plt.figure(figsize=(12, 5))
+        plt.suptitle(f"Comparison: Dropout vs. No Dropout on {dataset_name.upper()}", fontsize=16)
+
+        # Subplot 1: Training/Validation Loss
+        plt.subplot(1, 2, 1)
+        plt.plot(epochs_range, train_losses_no, 'b-o', label="Train Loss (No Dropout)")
+        plt.plot(epochs_range, val_losses_no, 'b--o', label="Val Loss (No Dropout)")
+        plt.plot(epochs_range, train_losses_do, 'r-o', label="Train Loss (Dropout)")
+        plt.plot(epochs_range, val_losses_do, 'r--o', label="Val Loss (Dropout)")
+        plt.xlabel("Epochs")
+        plt.ylabel("Loss")
+        plt.title("Loss Curves")
+        plt.legend()
+
+        # Subplot 2: Validation Accuracy
+        plt.subplot(1, 2, 2)
+        plt.plot(epochs_range, [acc * 100 for acc in val_accs_no], 'b-o', label="Val Acc (No Dropout)")
+        plt.plot(epochs_range, [acc * 100 for acc in val_accs_do], 'r-o', label="Val Acc (Dropout)")
+        plt.xlabel("Epochs")
+        plt.ylabel("Accuracy (%)")
+        plt.title("Validation Accuracy")
+        plt.legend()
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
